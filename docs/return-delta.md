@@ -1,0 +1,7 @@
+# Return-delta fixed-price curve lab
+
+`FixedPriceCurveHook` demonstrates custom accounting by consuming the entire exact-input amount in `beforeSwap`, paying output from hook-owned inventory, and returning a `BeforeSwapDelta` that reduces the core concentrated-liquidity swap amount to zero. Tests use a real `PoolManager`, router settlement, and ERC-20 balances in both trade directions.
+
+The curve has an immutable rational price and a per-swap input cap. It is also bound at deployment to one canonical ordered `currency0`/`currency1` pair, fee, and tick spacing. Both pool initialization and swaps validate that full configuration, preventing an unrelated or worthless-token pool from spending inventory prefunded for the intended pair. It rejects exact-output swaps, zero-rounded output, oversized input, and insufficient reserves. Reserve tokens are supplied by transferring them to the hook. The hook synchronizes the manager before paying either ERC20 or native output. Tests cover both paths.
+
+This is a learning implementation. It has no oracle, spread, fee, reserve rebalancing, withdrawal path, access control, or protection against a stale price being arbitraged. Raw token units must use compatible decimals. Production use requires inventory management, price updates with safety bounds, decimal normalization, slippage and deadline controls, pause and recovery mechanisms, and independent security review.
