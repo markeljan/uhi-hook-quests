@@ -70,6 +70,7 @@ contract FixedPriceCurveHookTest is Test, Deployers {
         uint256 trader1Before = currency1.balanceOf(address(this));
         uint256 hook0Before = currency0.balanceOf(address(hook));
         uint256 hook1Before = currency1.balanceOf(address(hook));
+        uint256 hook0ClaimsBefore = manager.balanceOf(address(hook), currency0.toId());
         (uint160 sqrtPriceBefore,,,) = manager.getSlot0(key.toId());
 
         BalanceDelta delta = swap(key, true, -amountIn.toInt256(), ZERO_BYTES);
@@ -78,7 +79,8 @@ contract FixedPriceCurveHookTest is Test, Deployers {
         assertEq(delta.amount1(), expectedOut.toInt256());
         assertEq(currency0.balanceOf(address(this)), trader0Before - amountIn);
         assertEq(currency1.balanceOf(address(this)), trader1Before + expectedOut);
-        assertEq(currency0.balanceOf(address(hook)), hook0Before + amountIn);
+        assertEq(currency0.balanceOf(address(hook)), hook0Before);
+        assertEq(manager.balanceOf(address(hook), currency0.toId()), hook0ClaimsBefore + amountIn);
         assertEq(currency1.balanceOf(address(hook)), hook1Before - expectedOut);
         (uint160 sqrtPriceAfter,,,) = manager.getSlot0(key.toId());
         assertEq(sqrtPriceAfter, sqrtPriceBefore, "core concentrated-liquidity curve should be bypassed");
@@ -171,6 +173,62 @@ contract FixedPriceCurveHookTest is Test, Deployers {
         assertEq(delta.amount0(), 5 ether);
         assertEq(address(nativeHook).balance, hookNativeBefore - 5 ether);
         assertEq(address(this).balance, traderNativeBefore + 5 ether);
+    }
+
+    function test_emptyManagerMintsThenSpendsClaimsAcrossBothDirections() public {
+        deployFreshManagerAndRouters();
+        deployMintAndApprove2Currencies();
+
+        address emptyHookAddress = address(FLAGS | uint160(2) << 100);
+        deployCodeTo(
+            "FixedPriceCurveHook.sol",
+            abi.encode(
+                manager,
+                currency0,
+                currency1,
+                uint24(3_000),
+                int24(60),
+                PRICE_NUMERATOR,
+                PRICE_DENOMINATOR,
+                MAXIMUM_INPUT
+            ),
+            emptyHookAddress
+        );
+        FixedPriceCurveHook emptyHook = FixedPriceCurveHook(payable(emptyHookAddress));
+        (PoolKey memory emptyKey,) = initPool(currency0, currency1, emptyHook, 3_000, SQRT_PRICE_1_1);
+
+        currency0.transfer(address(emptyHook), 100 ether);
+        currency1.transfer(address(emptyHook), 100 ether);
+        assertEq(currency0.balanceOf(address(manager)), 0, "manager starts without currency0 float");
+        assertEq(currency1.balanceOf(address(manager)), 0, "manager starts without currency1 float");
+
+        uint256 trader0Before = currency0.balanceOf(address(this));
+        uint256 trader1Before = currency1.balanceOf(address(this));
+        uint256 hook0PhysicalBefore = currency0.balanceOf(address(emptyHook));
+        uint256 hook1PhysicalBefore = currency1.balanceOf(address(emptyHook));
+
+        BalanceDelta first = swap(emptyKey, true, -5 ether, ZERO_BYTES);
+
+        assertEq(first.amount0(), -5 ether);
+        assertEq(first.amount1(), 10 ether);
+        assertEq(manager.balanceOf(address(emptyHook), currency0.toId()), 5 ether, "input credited as claim");
+        assertEq(currency0.balanceOf(address(emptyHook)), hook0PhysicalBefore, "input is not taken prematurely");
+        assertEq(currency1.balanceOf(address(emptyHook)), hook1PhysicalBefore - 10 ether);
+        assertEq(currency0.balanceOf(address(manager)), 5 ether, "trader settlement backs input claim");
+        assertEq(currency1.balanceOf(address(manager)), 0, "trader receives all funded output");
+
+        BalanceDelta reverse = swap(emptyKey, false, -12 ether, ZERO_BYTES);
+
+        assertEq(reverse.amount1(), -12 ether);
+        assertEq(reverse.amount0(), 6 ether);
+        assertEq(manager.balanceOf(address(emptyHook), currency0.toId()), 0, "reverse output burns prior claim");
+        assertEq(manager.balanceOf(address(emptyHook), currency1.toId()), 12 ether, "reverse input becomes claim");
+        assertEq(currency0.balanceOf(address(emptyHook)), hook0PhysicalBefore - 1 ether, "reserves top up claim");
+        assertEq(currency1.balanceOf(address(emptyHook)), hook1PhysicalBefore - 10 ether);
+        assertEq(currency0.balanceOf(address(manager)), 0, "burned claim releases its backing");
+        assertEq(currency1.balanceOf(address(manager)), 12 ether, "reverse settlement backs new claim");
+        assertEq(currency0.balanceOf(address(this)), trader0Before + 1 ether);
+        assertEq(currency1.balanceOf(address(this)), trader1Before - 2 ether);
     }
 
     function _expectHookRevert(bytes memory reason) internal {

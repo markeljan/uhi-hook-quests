@@ -98,17 +98,27 @@ contract FixedPriceCurveHook is BaseHook {
 
         Currency inputCurrency = params.zeroForOne ? key.currency0 : key.currency1;
         Currency outputCurrency = params.zeroForOne ? key.currency1 : key.currency0;
-        uint256 available = outputCurrency.balanceOf(address(this));
+        uint256 outputClaimBalance = poolManager.balanceOf(address(this), outputCurrency.toId());
+        uint256 available = outputClaimBalance + outputCurrency.balanceOf(address(this));
         if (available < amountOut) {
             revert InsufficientReserves(Currency.unwrap(outputCurrency), available, amountOut);
         }
 
-        // The hook takes the trader's input credit and pays the output debt from its own reserves.
-        poolManager.take(inputCurrency, address(this), amountIn);
-        _settle(outputCurrency, amountOut);
+        // Claims do not require the singleton to hold physical input tokens before the router settles.
+        // They become backed by the trader's payment at the end of the unlock callback.
+        poolManager.mint(address(this), inputCurrency.toId(), amountIn);
+        _fundOutput(outputCurrency, amountOut, outputClaimBalance);
 
         BeforeSwapDelta hookDelta = toBeforeSwapDelta(amountIn.toInt128(), -amountOut.toInt128());
         return (this.beforeSwap.selector, hookDelta, 0);
+    }
+
+    function _fundOutput(Currency currency, uint256 amount, uint256 claimBalance) internal {
+        uint256 claimsUsed = claimBalance < amount ? claimBalance : amount;
+        if (claimsUsed != 0) poolManager.burn(address(this), currency.toId(), claimsUsed);
+
+        uint256 physicalAmount = amount - claimsUsed;
+        if (physicalAmount != 0) _settle(currency, physicalAmount);
     }
 
     function _validatePool(PoolKey calldata key) internal view {
