@@ -4,56 +4,76 @@ pragma solidity 0.8.26;
 import {BaseHook} from "v4-periphery/src/utils/BaseHook.sol";
 
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
 /// @title DynamicGasFeeHook
-/// @notice Linearly increases the per-swap LP fee as the transaction gas price rises.
-/// @dev The configured gas-price range and LP-fee range provide explicit lower and upper bounds.
+/// @notice Adjusts a pool's fee when the transaction gas price leaves a 10% band around its smoothed history.
+/// @dev The first positive gas sample establishes each pool's reference. Later samples are capped before smoothing.
 contract DynamicGasFeeHook is BaseHook {
     using LPFeeLibrary for uint24;
 
-    uint256 public immutable floorGasPrice;
-    uint256 public immutable ceilingGasPrice;
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant DEVIATION_BPS = 1_000;
+
     uint24 public immutable minimumFee;
+    uint24 public immutable neutralFee;
     uint24 public immutable maximumFee;
+    uint16 public immutable smoothingWeightBps;
+    uint256 public immutable maximumTrackedGasPrice;
+
+    mapping(PoolId poolId => uint256 gasPrice) public gasPriceAverage;
 
     error InvalidConfiguration();
     error DynamicFeePoolRequired();
 
     constructor(
         IPoolManager manager,
-        uint256 _floorGasPrice,
-        uint256 _ceilingGasPrice,
         uint24 _minimumFee,
-        uint24 _maximumFee
+        uint24 _neutralFee,
+        uint24 _maximumFee,
+        uint16 _smoothingWeightBps,
+        uint256 _maximumTrackedGasPrice
     ) BaseHook(manager) {
-        if (_floorGasPrice >= _ceilingGasPrice || _minimumFee > _maximumFee || _maximumFee > LPFeeLibrary.MAX_LP_FEE) revert InvalidConfiguration();
+        if (
+            _minimumFee > _neutralFee || _neutralFee > _maximumFee || _maximumFee > LPFeeLibrary.MAX_LP_FEE
+                || _smoothingWeightBps == 0 || _smoothingWeightBps > BPS_DENOMINATOR || _maximumTrackedGasPrice == 0
+        ) revert InvalidConfiguration();
 
-        floorGasPrice = _floorGasPrice;
-        ceilingGasPrice = _ceilingGasPrice;
         minimumFee = _minimumFee;
+        neutralFee = _neutralFee;
         maximumFee = _maximumFee;
+        smoothingWeightBps = _smoothingWeightBps;
+        maximumTrackedGasPrice = _maximumTrackedGasPrice;
     }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory permissions) {
+        permissions.beforeInitialize = true;
         permissions.beforeSwap = true;
+        permissions.afterSwap = true;
     }
 
-    /// @notice Returns the bounded LP fee for a gas price, in hundredths of a basis point.
-    function quoteFee(uint256 gasPrice) public view returns (uint24) {
-        if (gasPrice <= floorGasPrice) return minimumFee;
-        if (gasPrice >= ceilingGasPrice) return maximumFee;
+    function _beforeInitialize(address, PoolKey calldata key, uint160) internal pure override returns (bytes4) {
+        if (!key.fee.isDynamicFee()) revert DynamicFeePoolRequired();
+        return this.beforeInitialize.selector;
+    }
 
-        uint256 gasProgress = gasPrice - floorGasPrice;
-        uint256 gasRange = ceilingGasPrice - floorGasPrice;
-        uint256 feeRange = maximumFee - minimumFee;
-        // Safe because interpolation cannot exceed `maximumFee`, which is at most 1_000_000.
-        // forge-lint: disable-next-line(unsafe-typecast)
-        return minimumFee + uint24(gasProgress * feeRange / gasRange);
+    /// @notice Quotes the fee against the pool's reference before the current swap updates it.
+    function quoteFee(PoolId poolId, uint256 gasPrice) public view returns (uint24) {
+        uint256 average = gasPriceAverage[poolId];
+        if (average == 0) return neutralFee;
+
+        uint256 boundedGasPrice = _boundGasPrice(gasPrice);
+        uint256 tolerance = FullMath.mulDiv(average, DEVIATION_BPS, BPS_DENOMINATOR);
+        if (boundedGasPrice > average && boundedGasPrice - average > tolerance) return minimumFee;
+        if (boundedGasPrice < average && average - boundedGasPrice > tolerance) return maximumFee;
+        return neutralFee;
     }
 
     function _beforeSwap(address, PoolKey calldata key, SwapParams calldata, bytes calldata)
@@ -64,7 +84,31 @@ contract DynamicGasFeeHook is BaseHook {
     {
         if (!key.fee.isDynamicFee()) revert DynamicFeePoolRequired();
 
-        uint24 fee = quoteFee(tx.gasprice);
+        uint24 fee = quoteFee(key.toId(), tx.gasprice);
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee | LPFeeLibrary.OVERRIDE_FEE_FLAG);
+    }
+
+    function _afterSwap(address, PoolKey calldata key, SwapParams calldata, BalanceDelta, bytes calldata)
+        internal
+        override
+        returns (bytes4, int128)
+    {
+        PoolId poolId = key.toId();
+        uint256 sample = _boundGasPrice(tx.gasprice);
+        uint256 previous = gasPriceAverage[poolId];
+
+        if (previous == 0) {
+            gasPriceAverage[poolId] = sample;
+        } else if (sample > previous) {
+            gasPriceAverage[poolId] = previous + FullMath.mulDiv(sample - previous, smoothingWeightBps, BPS_DENOMINATOR);
+        } else {
+            gasPriceAverage[poolId] = previous - FullMath.mulDiv(previous - sample, smoothingWeightBps, BPS_DENOMINATOR);
+        }
+
+        return (this.afterSwap.selector, 0);
+    }
+
+    function _boundGasPrice(uint256 gasPrice) internal view returns (uint256) {
+        return gasPrice < maximumTrackedGasPrice ? gasPrice : maximumTrackedGasPrice;
     }
 }
